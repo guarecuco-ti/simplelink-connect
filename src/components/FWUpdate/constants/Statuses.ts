@@ -20,4 +20,5 @@ export const OadStatus = {
     OAD_PROFILE_IMG_ID_TIMEOUT: 16,     // Image identify timed out, too many failures.
     OAD_PROFILE_APP_STOP_PROCESS: 17,   // Target app cancel oad
     OAD_PROFILE_ERROR: 18,              // General internal error of the module
+    OAD_PROFILE_REBOOT_PENDING: 19,     // Silent OAD reboot already armed, rejecting new attempt
 } as const;

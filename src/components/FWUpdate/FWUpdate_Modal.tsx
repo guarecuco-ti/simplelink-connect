@@ -97,7 +97,7 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
   // Silent OAD: delay the reboot until the remote is idle or disconnects.
   // Only Reference RCU firmware supports it - gated on the FMR service below.
   const [silentOadEnabled, setSilentOadEnabled] = useState<boolean>(false);
-  const [silentOadDelaySeconds, setSilentOadDelaySeconds] = useState<string>('10');
+  const [silentOadDelaySeconds, setSilentOadDelaySeconds] = useState<string>('60');
 
   const { currentRepoDetails, updateRepository } = useFirmwareRepoContext();
 
@@ -279,6 +279,16 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
     navigation.goBack();
   };
 
+  // Done button after a completed OAD - just closes, no CANCEL_OAD (that would
+  // un-arm a pending Silent OAD reboot the device is still waiting to do).
+  const closeAfterDone = () => {
+    setUpdating(false);
+    setSelectedFW(undefined);
+    setProgress(0);
+    charValueSubscription.current?.remove();
+    navigation.goBack();
+  };
+
   async function asyncStartFwUpdate(peripheralId: string) {
     console.log('calling getFwUdateImage: ', peripheralId);
     fwImageByteArray = await getFwUpdateImage();
@@ -293,7 +303,11 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
 
     if (oadService === oadService) {
       // Prepare for sending image
-      await sendImagUpdateReq(peripheralId);
+      const identifyAccepted = await sendImagUpdateReq(peripheralId);
+      if (!identifyAccepted) {
+        setUpdating(false);
+        return;
+      }
       // Start sending image
       sendImageBlocks(peripheralId);
 
@@ -619,10 +633,12 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
   function resetAfterOad(peripheralId: string) {
     setStatus(
       silentOadEnabled
-        ? `Silent OAD armed - reboots after ${silentOadDelaySeconds}s idle or on disconnect. Reopen this screen after to confirm the new version.`
+        ? `Silent OAD armed - reboots after ${silentOadDelaySeconds}s idle or on disconnect.`
         : 'Waiting for device reset in to new FW'
     );
-    setProgress(0.98);
+    // Silent OAD stays connected for the whole delay window - armed is the
+    // completion signal here, don't wait on a disconnect that may not come for a while.
+    setProgress(silentOadEnabled ? 1 : 0.98);
 
     disconnectSubscription.current?.remove();
     disconnectSubscription.current = BleManager.onDisconnectPeripheral(
@@ -696,7 +712,7 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
     return imgVersionMajor + '.' + imgVersionMinor + '.' + imgRevision + '.' + imgBuildNum
   }
 
-  async function sendImagUpdateReq(peripheralId: string) {
+  async function sendImagUpdateReq(peripheralId: string): Promise<boolean> {
     console.log('sendImagUpdateReq');
 
     setStatus('Starting FW Update');
@@ -876,14 +892,25 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
     );
     console.log('ImageIdentify Rsp: ', rsp);
 
-    if (rsp == OadStatus.OAD_PROFILE_SUCCESS) {
+    // Accepted image identifies with a single status byte on this characteristic.
+    // A rejection from the state machine (e.g. already mid-OAD) instead comes back as a
+    // generic [event, status] control-point response on FFC5 - status is always the last byte.
+    const identifyStatus = rsp[rsp.length - 1];
+
+    if (identifyStatus === OadStatus.OAD_PROFILE_SUCCESS) {
       setStatus('Image header accepted');
+    } else if (identifyStatus === OadStatus.OAD_PROFILE_ALREADY_STARTED) {
+      setStatus('Device is waiting to reboot from a previous update - try again after it reboots.');
+      console.log('OAD rejected, reboot pending', identifyStatus)
+      return false;
     } else {
       setStatus('Image header reject - select correct image type');
-      console.log('Invalid image', rsp)
+      console.log('Invalid image', identifyStatus)
+      return false;
     }
 
     BleManager.startNotification(peripheralId, UUID.OadServiceUuid, UUID.ImageControlPointUuid);
+    return true;
   }
 
   // Original OAD block transfer function
@@ -930,7 +957,8 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
           // Download complete
           if (value[1] === OadStatus.OAD_PROFILE_DL_COMPLETE) {
             console.log('OAD download complete. Elapsed: ' + (Date.now() - transferStartTime) + 'ms');
-            charValueSubscription.current?.remove();
+            // Don't unsubscribe here - still need this listener for the
+            // ENABLE_IMG confirmation notify coming next on the same characteristic.
 
             // Regular OAD: send ENABLE_IMG. Silent OAD appends a 2-byte
             // big-endian delay-seconds (0-65535, wire format is 2 bytes).
@@ -949,8 +977,9 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
                 ImgControlPointCmd.length
               );
               console.log('Sent OAD_EVT_ENABLE_IMG');
-              setProgress(1);
-              setStatus('Firmware update complete!');
+              // Don't jump to progress=1/Done yet - wait for the ENABLE_IMG confirmation
+              // notify below, which is the real signal reboot is actually armed.
+              setStatus('Finishing update...');
             } catch (error) {
               console.log('Write failed: ' + error);
               setStatus('Failed to enable image');
@@ -985,7 +1014,12 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
         // OAD Finished - received ENABLE_IMG confirmation
         else if (characteristic.toUpperCase() === UUID.ImageControlPointUuid && value[0] === OadEvent.OAD_EVT_ENABLE_IMG) {
           console.log('Received ENABLE_IMG confirmation', value[1]);
-          resetAfterOad(peripheral);
+          charValueSubscription.current?.remove();
+          if (value[1] === OadStatus.OAD_PROFILE_REBOOT_PENDING) {
+            setStatus('Reboot already scheduled from a previous update - wait for it to complete before retrying.');
+          } else {
+            resetAfterOad(peripheral);
+          }
         }
       }
     );
@@ -1442,7 +1476,7 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
           <View
             style={{ flex: 2, flexDirection: 'row', justifyContent: 'space-evenly', marginVertical: 30 }}
           >
-            <TouchableOpacity style={[styles.buttonWrapper, { width: "90%" }]} onPress={cancel}>
+            <TouchableOpacity style={[styles.buttonWrapper, { width: "90%" }]} onPress={closeAfterDone}>
               <Text style={{ color: Colors.blue, fontSize: 18 }}>Done</Text>
             </TouchableOpacity>
           </View>
