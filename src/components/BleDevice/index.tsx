@@ -100,6 +100,8 @@ const BleDevice: React.FC<BleDeviceProps> = ({ peripheralId, ...props }) => {
       }));
     } catch (error) {
       console.log('retrieveServices error:', error);
+      setState(prev => ({ ...prev, deviceState: 'Disconnected' }));
+      throw error;
     }
   }, []);
 
@@ -255,7 +257,7 @@ const BleDevice: React.FC<BleDeviceProps> = ({ peripheralId, ...props }) => {
       disconnectSubscription.current = BleManager.onDisconnectPeripheral(onDisconnect);
 
       BleManager.isPeripheralConnected(peripheralId, []).then(isConnected => {
-        if (isConnected) discover(peripheralId);
+        if (isConnected) discover(peripheralId).catch(() => connect(peripheralId));
         else connect(peripheralId);
       });
 
