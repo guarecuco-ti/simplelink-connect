@@ -31,11 +31,11 @@
  */
 
 import React, { useMemo } from 'react';
-import { Platform, ScrollView, EventSubscription } from 'react-native';
+import { Platform, ScrollView, EventSubscription, TextInput } from 'react-native';
 import { LinearProgress } from '@rneui/base';
 import { useEffect, useRef, useState } from 'react';
 import { StyleSheet } from 'react-native';
-import { Text, TouchableOpacity, View } from '../Themed';
+import { Switch, Text, TouchableOpacity, View } from '../Themed';
 import Colors from '../../constants/Colors';
 import BleManager from 'react-native-ble-manager';
 import { decode } from 'base-64';
@@ -94,6 +94,10 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
   const [imgLength, setImgLength] = useState<number>(0);
   const [localFileError, setLocalFileError] = useState<'success' | 'error' | 'cancelled' | 'fs' | 'unknownImgType' | null>(null);
   const [deviceSwVersion, setDeviceSwVersion] = useState<string | undefined>(undefined);
+  // Silent OAD: delay the reboot until the remote is idle or disconnects.
+  // Only Reference RCU firmware supports it - gated on the FMR service below.
+  const [silentOadEnabled, setSilentOadEnabled] = useState<boolean>(false);
+  const [silentOadDelaySeconds, setSilentOadDelaySeconds] = useState<string>('10');
 
   const { currentRepoDetails, updateRepository } = useFirmwareRepoContext();
 
@@ -117,6 +121,11 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
   let fwImageByteArray: Uint8Array;
   let blockSize = 20;
   let numBlocks = 0;
+
+  // Number of OAD blocks kept in flight ahead of firmware's confirmed position.
+  // Firmware acks every block unconditionally regardless of send order, so pipelining
+  // ahead removes the round-trip wait per block instead of one write-then-wait-for-ack cycle.
+  const OAD_BLOCK_WINDOW_SIZE = 4;
 
   useEffect(() => {
     /* component mounting, disable lock screen sleep */
@@ -157,12 +166,10 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
     }
 
     msOad.isMultistepOadMode().then((isMsOad) => {
+      queryInitialDeviceVersion();
       if (!isMsOad) {
-        // classic OAD, fetch firmwares.
+        // classic OAD, also fetch firmwares.
         fetchFirmwares();
-      } else {
-        // MS-OAD mode, query device version
-        queryInitialDeviceVersion();
       }
     })
 
@@ -610,7 +617,11 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
   }
 
   function resetAfterOad(peripheralId: string) {
-    setStatus('Waiting for device reset in to new FW');
+    setStatus(
+      silentOadEnabled
+        ? `Silent OAD armed - reboots after ${silentOadDelaySeconds}s idle or on disconnect. Reopen this screen after to confirm the new version.`
+        : 'Waiting for device reset in to new FW'
+    );
     setProgress(0.98);
 
     disconnectSubscription.current?.remove();
@@ -619,7 +630,6 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
         setProgress(1);
         setStatus('Device reset');
         console.log('resetAfterOad - device disconnected');
-
         disconnectSubscription.current?.remove();
       }
     );
@@ -694,7 +704,15 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
 
     /* Set the MTU Size - Android only API 21+, iOS initiates an MTU exchange automatically upon connection */
     if (Platform.OS === 'android') {
-      await BleManager.requestConnectionPriority(peripheralId, 1);
+      try {
+        const prioResult = await BleManager.requestConnectionPriority(peripheralId, 1); // CONNECTION_PRIORITY_HIGH (~11.25-15ms)
+        console.log('requestConnectionPriority resolved:', JSON.stringify(prioResult));
+      } catch (prioError) {
+        console.log('requestConnectionPriority threw:', prioError);
+      }
+      // requestConnectionPriority resolves once the OS accepts the request, not once the
+      // renegotiation actually lands over the air - give it time before hammering the link.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       let mtu = await BleManager.requestMTU(peripheralId, 255);
       console.log('MTU:', mtu)
     }
@@ -875,22 +893,51 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
 
     console.log('sendImageBlocks: fwImageByteArray.length: ', fwImageByteArray.length);
     let prevProgress = 0;
+    let nextBlockToSend = 0;
+    let latestConfirmedBlock = 0;
+    let fillingWindow = false;
+    const transferStartTime = Date.now();
+
+    // Sends block at idx, size computed locally so send-ahead order doesn't matter
+    function sendBlockAtIndex(idx: number): Promise<void> {
+      const fwImageByteOffset = idx * blockSize;
+      const thisBlockSize = idx === numBlocks ? fwImageByteArray.length - blockSize * numBlocks : blockSize;
+      const blockData = fwImageByteArray.slice(fwImageByteOffset, fwImageByteOffset + thisBlockSize);
+      console.log('[' + (Date.now() - transferStartTime) + 'ms] Block Request[' + thisBlockSize + ']: ' + idx + ' of ' + numBlocks);
+      return writeBlock(peripheralId, idx, blockData, thisBlockSize);
+    }
+
+    // Keeps K blocks in flight ahead of ack. Locked - handler can re-enter mid-await.
+    async function fillWindow(): Promise<void> {
+      if (fillingWindow) return;
+      fillingWindow = true;
+      try {
+        while (nextBlockToSend <= Math.min(latestConfirmedBlock + OAD_BLOCK_WINDOW_SIZE - 1, numBlocks)) {
+          await sendBlockAtIndex(nextBlockToSend);
+          nextBlockToSend++;
+        }
+      } finally {
+        fillingWindow = false;
+      }
+    }
 
     // Add event listener for original OAD block requests
     charValueSubscription.current = BleManager.onDidUpdateValueForCharacteristic(
       async ({ value, peripheral, characteristic, service }: { value: number[]; peripheral: string; characteristic: string; service: string }) => {
-        let blockRequested: number;
-
         // Block request
         if (characteristic.toUpperCase() === UUID.ImageControlPointUuid && value[0] === OadProtocolOpCode.OAD_RSP_BLK_RSP_NOTIF) {
 
           // Download complete
           if (value[1] === OadStatus.OAD_PROFILE_DL_COMPLETE) {
-            console.log('OAD download complete');
+            console.log('OAD download complete. Elapsed: ' + (Date.now() - transferStartTime) + 'ms');
             charValueSubscription.current?.remove();
 
-            // Regular OAD: send ENABLE_IMG
-            let ImgControlPointCmd = new Uint8Array([OadEvent.OAD_EVT_ENABLE_IMG]);
+            // Regular OAD: send ENABLE_IMG. Silent OAD appends a 2-byte
+            // big-endian delay-seconds (0-65535, wire format is 2 bytes).
+            const delaySeconds = Math.min(65535, Math.max(0, parseInt(silentOadDelaySeconds, 10) || 0));
+            let ImgControlPointCmd = silentOadEnabled && delaySeconds > 0
+              ? new Uint8Array([OadEvent.OAD_EVT_ENABLE_IMG, (delaySeconds >> 8) & 0xff, delaySeconds & 0xff])
+              : new Uint8Array([OadEvent.OAD_EVT_ENABLE_IMG]);
             var ImgControlPointCmdArray = Array.from(ImgControlPointCmd);
 
             try {
@@ -899,7 +946,7 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
                 UUID.OadServiceUuid,
                 UUID.ImageControlPointUuid,
                 ImgControlPointCmdArray,
-                1
+                ImgControlPointCmd.length
               );
               console.log('Sent OAD_EVT_ENABLE_IMG');
               setProgress(1);
@@ -909,28 +956,18 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
               setStatus('Failed to enable image');
             }
           }
-          // Block request - send next block
+          // Ack for confirmedBlock - refill window instead of resending just this one
           else if (value[1] === OadStatus.OAD_PROFILE_SUCCESS) {
-            blockRequested = value[2] + (value[3] << 8) + (value[4] << 16) + (value[5] << 24);
+            const confirmedBlock = value[2] + (value[3] << 8) + (value[4] << 16) + (value[5] << 24);
 
-            let progressUpdate = 0.98 * (blockRequested / numBlocks);
+            let progressUpdate = 0.98 * (confirmedBlock / numBlocks);
             if (Math.floor(progressUpdate * 100) > prevProgress) {
               setProgress(progressUpdate);
             }
             prevProgress = Math.floor(progressUpdate * 100);
 
-            const fwImageByteOffset = blockRequested * blockSize;
-
-            // Last block - reduce block size to match last bytes of image
-            if (blockRequested === numBlocks) {
-              blockSize = fwImageByteArray.length - blockSize * numBlocks;
-              console.log('LastBlock: size %d', blockSize);
-            }
-
-            console.log('Block Request[' + blockSize + ']: ' + blockRequested + ' of ' + numBlocks);
-
-            const blockData = fwImageByteArray.slice(fwImageByteOffset, fwImageByteOffset + blockSize);
-            await writeBlock(peripheralId, blockRequested, blockData, blockSize);
+            latestConfirmedBlock = confirmedBlock;
+            fillWindow();
           }
           // Error
           else {
@@ -938,6 +975,11 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
             alert('OAD Failed');
             setStatus('OAD block transfer failed');
             setProgress(0);
+            // Connection stays alive on failure (unlike success, which reboots) - drop
+            // back to balanced priority instead of leaving it pinned high.
+            if (Platform.OS === 'android') {
+              BleManager.requestConnectionPriority(peripheralId, 0);
+            }
           }
         }
         // OAD Finished - received ENABLE_IMG confirmation
@@ -978,8 +1020,8 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
     BlockRspCmd.set(blockData, 4);
     var BlockRspCmdArray = Array.from(BlockRspCmd);
 
-    // Return the Promise so await works properly
-    return BleManager.write(
+    // No-response write - Write Request would serialize each block, defeating the window
+    return BleManager.writeWithoutResponse(
       peripheralId,
       UUID.OadServiceUuid,
       UUID.ImageBlockRequestUuid,
@@ -1276,6 +1318,36 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
         </View>
       )}
 
+      {!msOad.msOadEnabled && (
+        <View style={{ marginBottom: 20 }}>
+          <Text style={[styles.sectionHeader, { backgroundColor: Colors.lightGray }]}>
+            Silent OAD
+          </Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', paddingLeft: 20, paddingTop: 10 }}>
+            <Switch
+              value={silentOadEnabled}
+              onValueChange={setSilentOadEnabled}
+              disabled={updating}
+            />
+            <Text style={{ marginLeft: 10 }}>Delay reboot until remote is idle or disconnects</Text>
+          </View>
+          {silentOadEnabled && (
+            <View style={{ flexDirection: 'row', alignItems: 'center', paddingLeft: 20, paddingTop: 10 }}>
+              <Text>Delay (seconds): </Text>
+              <TextInput
+                value={silentOadDelaySeconds}
+                onChangeText={setSilentOadDelaySeconds}
+                placeholder="0-65535"
+                keyboardType="numeric"
+                maxLength={5}
+                editable={!updating}
+                style={styles.silentOadDelayInput}
+              />
+            </View>
+          )}
+        </View>
+      )}
+
       {msOad.msOadEnabled && (
         <View style={{ marginBottom: 10 }}>
           <Text
@@ -1315,6 +1387,12 @@ const FWUpdate_Modal: React.FC<Props> = ({ peripheralId }: any) => {
         >
           Status
         </Text>
+        {!msOad.msOadEnabled && (
+          <Text style={{ paddingLeft: 20, marginTop: 10 }}>
+            <Text style={{ fontWeight: 'bold' }}>SW Version: </Text>
+            {deviceSwVersion || 'Querying...'}
+          </Text>
+        )}
         <Text style={{ paddingLeft: 20, marginTop: 20 }}>{status}</Text>
         {updating && (
           <View>
@@ -1417,6 +1495,15 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: 'bold',
     paddingVertical: 20,
+  },
+  silentOadDelayInput: {
+    width: 100,
+    textAlign: 'center',
+    marginLeft: 10,
+    borderColor: Colors.gray,
+    borderWidth: 1,
+    borderRadius: 4,
+    padding: 6,
   },
   // MS-OAD Card-based styles
   msOadSubtitle: {
